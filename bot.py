@@ -1,5 +1,7 @@
 import asyncio
+import os
 import random
+import threading
 import time
 from datetime import datetime, timedelta
 
@@ -7,24 +9,94 @@ import pytz
 from pyquotex.stable_api import Quotex
 from telethon import TelegramClient
 
-EMAIL = "wagife9306@mugstock.com"
-PASSWORD = "latchi23@@"
+EMAIL = os.environ.get("QUOTEX_EMAIL", "wagife9306@mugstock.com")
+PASSWORD = os.environ.get("QUOTEX_PASSWORD", "latchi23@@")
 
-API_ID = 33567199
-API_HASH = "3fdd30ef25043c39d8cc897d6251b8f1"
-CHANNEL = "@latchidz0"
+API_ID = int(os.environ.get("TELEGRAM_API_ID", "33567199"))
+API_HASH = os.environ.get("TELEGRAM_API_HASH", "3fdd30ef25043c39d8cc897d6251b8f1")
+CHANNEL = os.environ.get("TELEGRAM_CHANNEL", "@latchidz0")
 
 ASSETS = ["NZDCHF_otc", "USDINR_otc", "USDBDT_otc", "USDARS_otc", "USDPKR_otc"]
-BASE_AMOUNT = 1.0
+BASE_AMOUNT = float(os.environ.get("BASE_AMOUNT", "1.0"))
 
 ALGIERS = pytz.timezone("Africa/Algiers")
-
-bot_state = {"trades": 0, "wins": 0, "losses": 0, "balance": 0.0, "signals": [], "status_msg": ""}
+MAX_LOG_LINES = 100
+MAX_SIGNALS = 50
 
 
 def now_local():
-    """Return timezone-aware current time in Algeria."""
     return datetime.now(ALGIERS)
+
+
+class BotState:
+    def __init__(self):
+        self._lock = threading.Lock()
+        self.trades = 0
+        self.wins = 0
+        self.losses = 0
+        self.balance = 0.0
+        self.signals = []
+        self.status = "متوقف"
+        self.running = False
+        self.log = []
+
+    def reset_stats(self):
+        with self._lock:
+            self.trades = 0
+            self.wins = 0
+            self.losses = 0
+            self.balance = 0.0
+            self.signals = []
+
+    def add_log(self, msg):
+        ts = now_local().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        with self._lock:
+            self.log.append(line)
+            if len(self.log) > MAX_LOG_LINES:
+                self.log = self.log[-MAX_LOG_LINES:]
+
+    def add_signal(self, asset, direction, entry, result="pending", profit=None):
+        sig = {
+            "time": now_local().strftime("%H:%M"),
+            "asset": asset.replace("_otc", "").upper(),
+            "direction": direction.upper(),
+            "entry": entry,
+            "result": result,
+            "profit": profit,
+        }
+        with self._lock:
+            self.signals.insert(0, sig)
+            if len(self.signals) > MAX_SIGNALS:
+                self.signals = self.signals[:MAX_SIGNALS]
+        return sig
+
+    def update_signal(self, sig, result, profit):
+        with self._lock:
+            sig["result"] = result
+            sig["profit"] = profit
+
+    def to_dict(self):
+        with self._lock:
+            total = self.wins + self.losses
+            win_rate = round(self.wins / total * 100) if total > 0 else 0
+            return {
+                "running": self.running,
+                "status": self.status,
+                "balance": round(self.balance, 2),
+                "trades": self.trades,
+                "wins": self.wins,
+                "losses": self.losses,
+                "win_rate": win_rate,
+                "signals": list(self.signals),
+                "log": list(self.log),
+            }
+
+
+state = BotState()
+
+_bot_thread = None
+_stop_event = threading.Event()
 
 
 # =========================
@@ -75,15 +147,14 @@ async def decide_direction(client, asset):
             return "put"
         return random.choice(["call", "put"])
     except Exception as e:
-        print("DECIDE ERROR:", e)
+        state.add_log(f"DECIDE ERROR: {e}")
         return random.choice(["call", "put"])
 
 
 # =========================
-# RESOLVE A TRULY OPEN ASSET
+# RESOLVE OPEN ASSETS
 # =========================
 async def get_open_assets(client):
-    """Return a list of OPEN assets from our OTC list (no _otc swap)."""
     candidates = list(ASSETS)
     random.shuffle(candidates)
     open_list = []
@@ -93,7 +164,7 @@ async def get_open_assets(client):
             if asset_data and asset_data[2]:
                 open_list.append(asset_name)
         except Exception as e:
-            print(f"ASSET CHECK ERROR ({asset}):", e)
+            state.add_log(f"ASSET CHECK ({asset}): {e}")
     return open_list if open_list else list(ASSETS)
 
 
@@ -101,8 +172,6 @@ async def get_open_assets(client):
 # EXECUTE + RESULT ENGINE
 # =========================
 async def trade_once(client, candidates, amount, direction, duration, target_time):
-    """جرّب الشراء على عدة أصول حتى ينجح واحد."""
-    # ندخل قبل بداية الشمعة بـ 1.5 ثانية عشان البوي تبعت في الوقت
     now_alg = now_local()
     wait_seconds = (target_time - now_alg).total_seconds() - 1.5
     if wait_seconds > 0:
@@ -111,7 +180,7 @@ async def trade_once(client, candidates, amount, direction, duration, target_tim
     try:
         before_balance = float(await client.get_balance())
     except Exception as e:
-        print("PRE-BUY BALANCE ERROR:", e)
+        state.add_log(f"PRE-BUY BALANCE ERROR: {e}")
         before_balance = 0.0
 
     used_asset = None
@@ -119,22 +188,21 @@ async def trade_once(client, candidates, amount, direction, duration, target_tim
     after_buy_balance = before_balance
 
     for asset in candidates:
-        print(f"🟡 BUY ATTEMPT: asset={asset} dir={direction} amount={amount} dur={duration} | before_bal={before_balance}")
+        state.add_log(f"BUY ATTEMPT: {asset} | {direction.upper()} | ${amount}")
         try:
             success, order_info = await client.buy(amount, asset, direction, duration, time_mode="TIME")
         except Exception as e:
-            print(f"BUY ERROR ({asset}):", e)
+            state.add_log(f"BUY ERROR ({asset}): {e}")
             continue
 
-        print(f"🟢 BUY RESPONSE [{asset}]: success={success} info={order_info}")
         if success and isinstance(order_info, dict) and "id" in order_info:
             order_id = order_info["id"]
             after_buy_balance = float(order_info.get("accountBalance", before_balance))
             used_asset = asset
-            print(f"✅ ORDER ID: {order_id} | ASSET: {asset} | AFTER BUY BALANCE: {after_buy_balance}")
+            state.add_log(f"ORDER OK: {asset} | ID={order_id}")
             break
         else:
-            print(f"❌ BUY FAILED for {asset}, trying next...")
+            state.add_log(f"BUY FAILED for {asset}, trying next...")
 
     if used_asset is None:
         return None, None, None, "none", 0.0
@@ -142,10 +210,9 @@ async def trade_once(client, candidates, amount, direction, duration, target_tim
     await asyncio.sleep(duration + 2)
 
     final_balance = before_balance
-    for i in range(15):
+    for _ in range(15):
         try:
             bal = await client.get_balance()
-            print(f"💵 CHECK BALANCE [{i+1}]:", bal)
             if float(bal) != float(after_buy_balance):
                 final_balance = float(bal)
                 break
@@ -160,102 +227,165 @@ async def trade_once(client, candidates, amount, direction, duration, target_tim
 
 
 # =========================
-# SAFE TELEGRAM SEND (مع reconnect)
+# SAFE TELEGRAM SEND
 # =========================
 async def safe_tg_send(tg, text):
     for attempt in range(3):
         try:
             if not tg.is_connected():
-                print(f"📡 TG reconnecting (attempt {attempt+1})…")
+                state.add_log(f"TG reconnecting (attempt {attempt + 1})...")
                 await tg.connect()
             await tg.send_message(CHANNEL, text)
-            print(f"📨 TG SENT: {text[:60]}")
             return True
         except Exception as e:
-            print(f"⚠️ TG SEND FAILED (attempt {attempt+1}):", e)
+            state.add_log(f"TG SEND FAILED (attempt {attempt + 1}): {e}")
             try:
                 await tg.disconnect()
             except Exception:
                 pass
             await asyncio.sleep(1.5)
-    print("❌ TG SEND GIVE UP:", text[:60])
+    state.add_log("TG SEND GIVE UP")
     return False
 
 
 # =========================
-# MAIN BOT
+# MAIN BOT LOOP
 # =========================
-async def main():
+async def _run_bot():
+    state.status = "جاري الاتصال..."
+    state.add_log("Bot starting...")
+
     quotex_client = Quotex(email=EMAIL, password=PASSWORD, lang="en")
     quotex_client.set_account_mode("PRACTICE")
     connected, reason = await quotex_client.connect()
     if not connected:
-        print("❌ فشل الاتصال:", reason)
+        state.add_log(f"Quotex connection failed: {reason}")
+        state.status = "فشل الاتصال"
+        state.running = False
         return
+
     await quotex_client.change_account("PRACTICE")
 
     try:
-        bot_state["balance"] = float(await quotex_client.get_balance())
+        state.balance = float(await quotex_client.get_balance())
     except Exception:
         pass
 
     tg = TelegramClient("session_pc", API_ID, API_HASH)
     await tg.start()
-    await safe_tg_send(tg, "🚀 LATCHI DZ BOT STABLE SMART STARTED")
+    await safe_tg_send(tg, "LATCHI DZ BOT STARTED")
 
-    while True:
+    state.status = "يعمل"
+    state.add_log("Bot connected. Trading loop started.")
+
+    while not _stop_event.is_set():
         try:
-            # نأخذ كل الأصول المفتوحة من قائمتنا الـ OTC
             open_assets = await get_open_assets(quotex_client)
             primary_asset = open_assets[0]
             direction = await decide_direction(quotex_client, primary_asset)
 
-            # الوقت يحسب بتوقيت الجزائر
             now_alg = now_local()
             next_minute = now_alg.replace(second=0, microsecond=0) + timedelta(minutes=1)
             if (next_minute - now_alg).total_seconds() < 4:
                 next_minute += timedelta(minutes=1)
             target_time = next_minute
+            entry_str = target_time.strftime("%H:%M")
 
-            # نحاول الشراء — لو فشل الأصل الأول يحاول التالي تلقائياً
+            sig = state.add_signal(primary_asset, direction, entry_str)
+
             order_id, asset_used, dir_used, result, profit = await trade_once(
                 quotex_client, open_assets, BASE_AMOUNT, direction, 60, target_time
             )
 
             if dir_used is None:
-                await safe_tg_send(tg, f"⚠️ الصفقة لم تنفذ | {primary_asset.upper()}")
-                await asyncio.sleep(3)
+                state.update_signal(sig, "fail", None)
+                await safe_tg_send(tg, f"Trade not executed | {primary_asset.upper()}")
+                state.add_log(f"Trade not executed for {primary_asset}")
+                if not _stop_event.is_set():
+                    await asyncio.sleep(3)
                 continue
 
-            # المعاينة تُرسل بعد نجاح الشراء بالأصل المستعمل فعلاً
-            preview_msg = f"""📊 صفقة جديدة LATCHI DZ VIP 🌟:
+            sig["asset"] = asset_used.replace("_otc", "").upper()
+            sig["direction"] = dir_used.upper()
 
-{asset_used.upper()} | M1 | {target_time.strftime('%H:%M')} | {"CALL 🔼" if dir_used=="call" else "PUT ⬇️"}
-
-#QUOTEX"""
+            preview_msg = (
+                f"New Signal LATCHI DZ VIP:\n\n"
+                f"{asset_used.upper()} | M1 | {entry_str} | "
+                f"{'CALL' if dir_used == 'call' else 'PUT'}\n\n#QUOTEX"
+            )
             await safe_tg_send(tg, preview_msg)
 
-            bot_state["trades"] += 1
+            with state._lock:
+                state.trades += 1
+
             if result == "win":
-                bot_state["wins"] += 1
-                await safe_tg_send(tg, f"🟢 ربح ✅ | {asset_used.upper()} | {dir_used.upper()} | +{profit}")
+                with state._lock:
+                    state.wins += 1
+                state.update_signal(sig, "win", profit)
+                state.add_log(f"WIN | {asset_used.upper()} | {dir_used.upper()} | +{profit}")
+                await safe_tg_send(tg, f"WIN | {asset_used.upper()} | {dir_used.upper()} | +{profit}")
             elif result == "loss":
-                bot_state["losses"] += 1
-                await safe_tg_send(tg, f"🔴 خسارة ❌ | {asset_used.upper()} | {dir_used.upper()} | {profit}")
+                with state._lock:
+                    state.losses += 1
+                state.update_signal(sig, "loss", profit)
+                state.add_log(f"LOSS | {asset_used.upper()} | {dir_used.upper()} | {profit}")
+                await safe_tg_send(tg, f"LOSS | {asset_used.upper()} | {dir_used.upper()} | {profit}")
             else:
-                await safe_tg_send(tg, f"⚪ النتيجة غير محددة | {asset_used.upper()} | {dir_used.upper()}")
+                state.update_signal(sig, "equal", 0.0)
+                state.add_log(f"EQUAL | {asset_used.upper()} | {dir_used.upper()}")
 
             try:
-                bot_state["balance"] = float(await quotex_client.get_balance())
+                state.balance = float(await quotex_client.get_balance())
             except Exception:
                 pass
 
-            await asyncio.sleep(10)
+            if not _stop_event.is_set():
+                await asyncio.sleep(10)
 
         except Exception as e:
-            print("MAIN LOOP ERROR:", e)
-            await asyncio.sleep(5)
+            state.add_log(f"LOOP ERROR: {e}")
+            if not _stop_event.is_set():
+                await asyncio.sleep(5)
+
+    state.add_log("Bot stopped.")
+    await safe_tg_send(tg, "LATCHI DZ BOT STOPPED")
+    try:
+        await tg.disconnect()
+    except Exception:
+        pass
+    try:
+        quotex_client.close()
+    except Exception:
+        pass
+
+    state.status = "متوقف"
+    state.running = False
 
 
-if __name__ == "__main__":
-    asyncio.run(main())
+def _thread_target():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(_run_bot())
+    finally:
+        loop.close()
+
+
+def start_bot():
+    global _bot_thread
+    if state.running:
+        return False
+    _stop_event.clear()
+    state.running = True
+    state.status = "جاري التشغيل..."
+    _bot_thread = threading.Thread(target=_thread_target, daemon=True)
+    _bot_thread.start()
+    return True
+
+
+def stop_bot():
+    if not state.running:
+        return False
+    state.status = "جاري الإيقاف..."
+    _stop_event.set()
+    return True
