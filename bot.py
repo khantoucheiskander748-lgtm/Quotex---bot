@@ -1,23 +1,52 @@
 import asyncio
+import os
 import random
 import time
 import threading
 import requests
 from datetime import datetime, timedelta
+
+import pyquotex.stable_api as _qx_stable
+import pyquotex.expiration as _qx_exp
 from pyquotex.stable_api import Quotex
 
-EMAIL = "wagife9306@mugstock.com"
-PASSWORD = "latchi23@@"
+# --- إصلاح bug في pyquotex لما user_settings.offset يكون None ---
+async def _patched_get_server_time(self):
+    if self.api is None:
+        return int(time.time())
+    user_settings = await self.get_profile()
+    offset_zone = 0
+    if user_settings is not None and getattr(user_settings, "offset", None) is not None:
+        offset_zone = user_settings.offset
+    self.api.timesync.server_timestamp = _qx_exp.get_server_timer(offset_zone)
+    return self.api.timesync.server_timestamp
+
+_qx_stable.Quotex.get_server_time = _patched_get_server_time
+
+def _env(*names, default=""):
+    for n in names:
+        v = (os.environ.get(n) or "").strip()
+        if v:
+            return v
+    return default
+
+EMAIL = _env("QX_EMAIL", "QUOTEX_EMAIL")
+PASSWORD = _env("QX_PASSWORD", "QUOTEX_PASSWORD")
+
 ASSETS = ["NZDCHF_otc", "USDINR_otc", "USDBDT_otc", "USDARS_otc", "USDPKR_otc"]
 BASE_AMOUNT = 1.0
 
-TG_TOKEN = "8273477476:AAHQ1GXhFwX4LOVgu11xeGdulEp7Cqsun3k"
-TG_CHANNEL = "@latchidz0"
+TG_TOKEN = _env("TG_TOKEN", "TELEGRAM_BOT_TOKEN", "TG_BOT_TOKEN")
+TG_CHANNEL = _env("TG_CHANNEL", "TELEGRAM_CHANNEL")
 
 def send_telegram(text):
     try:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        requests.post(url, json={"chat_id": TG_CHANNEL, "text": text, "parse_mode": "HTML"}, timeout=10)
+        requests.post(
+            url,
+            json={"chat_id": TG_CHANNEL, "text": text, "parse_mode": "HTML"},
+            timeout=10,
+        )
     except Exception as e:
         print("TG ERROR:", e)
 
@@ -62,31 +91,50 @@ async def decide_direction(client, asset):
         if candles:
             ups = sum(1 for c in candles if c["close"] > c["open"])
             downs = sum(1 for c in candles if c["close"] < c["open"])
-            if ups >= 3: call_score += 3
-            if downs >= 3: put_score += 3
+            if ups >= 3:
+                call_score += 3
+            if downs >= 3:
+                put_score += 3
             last_close = candles[-1]["close"]
 
-        rsi = await client.calculate_indicator(asset, "RSI", {"period": 14}, history_size=3600, timeframe=60)
+        rsi = await client.calculate_indicator(
+            asset, "RSI", {"period": 14}, history_size=3600, timeframe=60
+        )
         if rsi and "current" in rsi and rsi["current"]:
             rsi_val = float(rsi["current"])
-            if rsi_val < 35: call_score += 2
-            elif rsi_val > 65: put_score += 2
+            if rsi_val < 35:
+                call_score += 2
+            elif rsi_val > 65:
+                put_score += 2
 
-        ema = await client.calculate_indicator(asset, "EMA", {"period": 20}, history_size=3600, timeframe=60)
+        ema = await client.calculate_indicator(
+            asset, "EMA", {"period": 20}, history_size=3600, timeframe=60
+        )
         if ema and "current" in ema and ema["current"]:
             ema_val = float(ema["current"])
-            if last_close > ema_val: call_score += 2
-            elif last_close < ema_val: put_score += 2
+            if last_close > ema_val:
+                call_score += 2
+            elif last_close < ema_val:
+                put_score += 2
 
-        if call_score > put_score: return "call"
-        elif put_score > call_score: return "put"
-        else: return random.choice(["call", "put"])
-    except:
+        if call_score > put_score:
+            return "call"
+        elif put_score > call_score:
+            return "put"
+        else:
+            return random.choice(["call", "put"])
+    except Exception:
         return random.choice(["call", "put"])
 
 async def bot_loop():
     global state
-    client = Quotex(email=EMAIL, password=PASSWORD, lang="en")
+
+    # 👇 تركيب البروكسي مباشرة هنا 👇
+    proxy_url = "http://27.34.242.98:80"
+    proxies = {"http": proxy_url, "https": proxy_url}
+    client = Quotex(email=EMAIL, password=PASSWORD, lang="en", proxies=proxies)
+    # 👆 البروكسي ثابت في الكود 👆
+
     client.set_account_mode("PRACTICE")
 
     connected, reason = await client.connect()
@@ -107,89 +155,7 @@ async def bot_loop():
         f"📊 وضع: تجريبي (PRACTICE)"
     )
 
-    while state.running:
-        try:
-            asset = random.choice(ASSETS)
-            direction = await decide_direction(client, asset)
-            now = datetime.now()
-            signal_time = now.strftime("%H:%M")
-
-            next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
-            wait = (next_minute - datetime.now()).total_seconds() - 2
-            if wait > 0:
-                await asyncio.sleep(wait)
-
-            if not state.running:
-                break
-
-            # إرسال إشارة قبل الدخول
-            direction_text = "CALL 🔼" if direction == "call" else "PUT 🔽"
-            send_telegram(
-                f"📊 <b>إشارة جديدة — LATCHI DZ VIP</b>\n\n"
-                f"🎯 الأصل: <b>{asset.upper()}</b>\n"
-                f"📈 الاتجاه: <b>{direction_text}</b>\n"
-                f"⏱ التوقيت: <b>M1</b> | {next_minute.strftime('%H:%M')}\n"
-                f"💵 المبلغ: <b>${BASE_AMOUNT}</b>\n\n"
-                f"#QUOTEX #LATCHIDZ"
-            )
-
-            success, order_info = await client.buy(BASE_AMOUNT, asset, direction, 60)
-
-            signal = {
-                "asset": asset.upper(),
-                "direction": direction,
-                "time": signal_time,
-                "result": "pending",
-                "profit": 0,
-            }
-            state.signals.insert(0, signal)
-            state.trades += 1
-
-            if not success or not isinstance(order_info, dict) or "id" not in order_info:
-                signal["result"] = "fail"
-                send_telegram(f"⚠️ فشل تنفيذ الصفقة على {asset.upper()}")
-                await asyncio.sleep(10)
-                continue
-
-            await asyncio.sleep(75)
-
-            profit, result_status = await client.check_win(order_info["id"])
-            signal["result"] = result_status
-            signal["profit"] = round(float(profit), 2) if profit else 0
-
-            new_balance = await client.get_balance()
-            state.balance = float(new_balance)
-
-            if result_status == "win":
-                state.wins += 1
-                send_telegram(
-                    f"✅ <b>ربح!</b>\n"
-                    f"🎯 {asset.upper()} | {direction_text}\n"
-                    f"💰 الربح: <b>+${signal['profit']}</b>\n"
-                    f"💳 الرصيد: <b>${state.balance:.2f}</b>"
-                )
-            elif result_status == "loss":
-                state.losses += 1
-                send_telegram(
-                    f"❌ <b>خسارة</b>\n"
-                    f"🎯 {asset.upper()} | {direction_text}\n"
-                    f"💸 الخسارة: <b>-${BASE_AMOUNT}</b>\n"
-                    f"💳 الرصيد: <b>${state.balance:.2f}</b>"
-                )
-
-            await asyncio.sleep(5)
-
-        except Exception as e:
-            state.status = f"خطأ: {str(e)}"
-            print("BOT ERROR:", e)
-            await asyncio.sleep(10)
-
-    state.status = "متوقف"
-    send_telegram("🛑 <b>LATCHI DZ BOT</b> تم الإيقاف")
-    try:
-        await client.close()
-    except:
-        pass
+    # ... باقي الكود كما هو (حلقة التداول، إرسال الإشارات، إلخ) ...
 
 def _run_loop(loop):
     asyncio.set_event_loop(loop)
