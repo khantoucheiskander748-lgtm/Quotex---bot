@@ -3,3 +3,5 @@ flask-cors
 gunicorn
 git+https://github.com/cleitonleonel/pyquotex.git
 pytz
+telethon
+requests
